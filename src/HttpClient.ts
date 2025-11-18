@@ -18,13 +18,18 @@ export class HttpClient {
     constructor(config: IHttpConfig, private logger?: ILogger) {
         config.headers = config.headers || {};
         this.addUserAgentHeader(config.headers);
+        // Determine effective proxy config considering NO_PROXY
+        const effectiveProxy: IProxyConfig | false | undefined = this.getEffectiveProxyConfig(
+            config.proxy,
+            config.serverUrl
+        );
         this._axiosInstance = axios.create({
             baseURL: config.serverUrl,
             headers: config.headers,
             timeout: config.timeout,
-            proxy: this.getAxiosProxyConfig(config.proxy),
+            proxy: this.getAxiosProxyConfig(effectiveProxy),
             // Use instead of the default one since there is a bug in Axios if http -> https
-            httpsAgent: HttpClient.getHttpToHttpsProxyConfig(config.proxy),
+            httpsAgent: HttpClient.getHttpToHttpsProxyConfig(effectiveProxy),
         } as AxiosRequestConfig);
         this._basicAuth = {
             username: config.username,
@@ -91,6 +96,67 @@ export class HttpClient {
         }
         if (!requestParams.headers[HttpClient.AUTHORIZATION_HEADER]) {
             requestParams.headers[HttpClient.AUTHORIZATION_HEADER] = 'Bearer ' + this._accessToken;
+        }
+    }
+
+    /**
+     * Get effective proxy config considering NO_PROXY environment variable.
+     * @param proxyConfig - The configured proxy
+     * @param serverUrl - The target server URL
+     * @returns Effective proxy config
+     */
+    private getEffectiveProxyConfig(
+        proxyConfig: IProxyConfig | false | undefined,
+        serverUrl?: string
+    ): IProxyConfig | false | undefined {
+        if (proxyConfig !== undefined) {
+            // Explicit proxy config provided, use as is
+            return proxyConfig;
+        }
+        // No explicit proxy config, check environment variables
+        if (this.shouldBypassProxy(serverUrl)) {
+            return false; // Disable proxy
+        }
+        return undefined; // Use environment proxy
+    }
+
+    /**
+     * Check if proxy should be bypassed for the given server URL based on NO_PROXY.
+     * @param serverUrl - The target server URL
+     * @returns true if proxy should be bypassed
+     */
+    private shouldBypassProxy(serverUrl?: string): boolean {
+        if (!serverUrl) {
+            return false;
+        }
+        const noProxy: string | undefined = process.env.NO_PROXY || process.env.no_proxy;
+        if (!noProxy) {
+            return false;
+        }
+        try {
+            const url: URL = new URL(serverUrl);
+            const host: string = url.hostname;
+            const port: string = url.port;
+            const hostWithPort: string = port ? `${host}:${port}` : host;
+
+            // NO_PROXY is comma-separated list of hosts
+            const noProxyHosts: string[] = noProxy.split(',').map((h) => h.trim().toLowerCase());
+            return noProxyHosts.some((pattern: string) => {
+                const lowerPattern: string = pattern.toLowerCase();
+                // Simple matching: exact match or wildcard
+                if (lowerPattern === host.toLowerCase() || lowerPattern === hostWithPort.toLowerCase()) {
+                    return true;
+                }
+                // Support *.domain.com pattern
+                if (lowerPattern.startsWith('*.')) {
+                    const domain: string = lowerPattern.slice(2);
+                    return host.toLowerCase().endsWith(domain) || hostWithPort.toLowerCase().endsWith(domain);
+                }
+                return false;
+            });
+        } catch (error) {
+            // Invalid URL, don't bypass
+            return false;
         }
     }
 

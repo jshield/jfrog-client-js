@@ -96,7 +96,7 @@ describe('Xray System tests', () => {
                 process.env.NO_PROXY = clientConfig.platformUrl;
                 const response: any = await jfrogClient.xray().system().ping();
                 expect(response).toStrictEqual(PING_RES);
-                expect(isPassedThroughProxy).toBeTruthy();
+                expect(isPassedThroughProxy).toBeFalsy();
             });
 
             test('Ping empty proxy', async () => {
