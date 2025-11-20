@@ -110,7 +110,9 @@ export class HttpClient {
         serverUrl?: string
     ): IProxyConfig | false | undefined {
         if (proxyConfig !== undefined) {
-            // Explicit proxy config provided, use as is
+            if (this.shouldBypassProxy(serverUrl)) {
+                return false;  // Bypass proxy if URL matches NO_PROXY
+            }
             return proxyConfig;
         }
         // No explicit proxy config, check environment variables
