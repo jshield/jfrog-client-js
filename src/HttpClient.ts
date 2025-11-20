@@ -1,6 +1,5 @@
-import axios, { AxiosError, AxiosInstance, AxiosProxyConfig, AxiosRequestConfig } from 'axios';
+import got, { Got, Options } from 'got';
 import { IClientResponse, ILogger, IProxyConfig, RetryOnStatusCode } from '../model';
-import axiosRetry, { IAxiosRetryConfig } from 'axios-retry';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 export class HttpClient {
     private static readonly AUTHORIZATION_HEADER: string = 'Authorization';
@@ -13,7 +12,7 @@ export class HttpClient {
     public static readonly DEFAULT_TIMEOUT_IN_MILLISECONDS: number = 60000;
     private readonly _basicAuth: BasicAuth;
     private readonly _accessToken: string;
-    private readonly _axiosInstance: AxiosInstance;
+    private readonly _gotClient: Got;
 
     constructor(config: IHttpConfig, private logger?: ILogger) {
         config.headers = config.headers || {};
@@ -23,54 +22,116 @@ export class HttpClient {
             config.proxy,
             config.serverUrl
         );
-        this._axiosInstance = axios.create({
-            baseURL: config.serverUrl,
+        const gotOptions: Options = {
+            ...(config.serverUrl ? { prefixUrl: config.serverUrl } : {}),
             headers: config.headers,
-            timeout: config.timeout,
-            proxy: this.getAxiosProxyConfig(effectiveProxy),
-            // Use instead of the default one since there is a bug in Axios if http -> https
-            httpsAgent: HttpClient.getHttpToHttpsProxyConfig(effectiveProxy),
-        } as AxiosRequestConfig);
+            ...(config.timeout ? { timeout: config.timeout } : {}),
+            retry: {
+                limit: config.retries ?? HttpClient.DEFAULT_RETRIES,
+                calculateDelay: ({ attemptCount }) => {
+                    this.logger?.debug(`Retrying (attempt #${attemptCount})...`);
+                    return config.retryDelay ?? HttpClient.DEFAULT_RETRY_DELAY_IN_MILLISECONDS;
+                },
+                methods: ['GET', 'POST', 'PUT', 'HEAD', 'DELETE', 'OPTIONS', 'TRACE'],
+                statusCodes: [408, 413, 429, 500, 502, 503, 504],
+                errorCodes: ['ETIMEDOUT', 'ECONNRESET', 'EADDRINUSE', 'ECONNREFUSED', 'EPIPE', 'ENOTFOUND', 'ENETUNREACH', 'EAI_AGAIN'],
+            },
+            hooks: {
+                beforeRetry: [
+                    (options: Options, error?: any, retryCount?: number) => {
+                        if (error && error.response && error.response.statusCode === 403) {
+                            throw new Error('Do not retry on 403'); // Prevent retry
+                        }
+                        if (config.retryOnStatusCode && error && error.response) {
+                            if (!config.retryOnStatusCode(error.response.statusCode)) {
+                                throw new Error('Do not retry'); // Prevent retry
+                            }
+                        }
+                    }
+                ]
+            }
+        };
+
+        if (effectiveProxy !== false && effectiveProxy) {
+            const proxyUrl = `http://${effectiveProxy.host}:${effectiveProxy.port}`;
+            const proxyAgent = new HttpsProxyAgent(proxyUrl);
+            gotOptions.agent = {
+                http: proxyAgent,
+                https: HttpClient.getHttpToHttpsProxyConfig(effectiveProxy) || proxyAgent
+            };
+        }
+
+        this._gotClient = got.extend(gotOptions);
         this._basicAuth = {
             username: config.username,
             password: config.password,
         } as BasicAuth;
         this._accessToken = config.accessToken || '';
-        this.addRetryInterceptor(config);
-    }
-
-    private addRetryInterceptor(config: IHttpConfig): void {
-        const retryConfig: IAxiosRetryConfig = {
-            retries: config.retries ?? HttpClient.DEFAULT_RETRIES,
-            retryCondition: (error: AxiosError) => this.shouldRetry(config, error),
-            retryDelay: (retryCount: number, err: AxiosError) => {
-                this.logger?.debug(`Request ended with error: ${err}\nRetrying (attempt #${retryCount})...`);
-                return config.retryDelay ?? HttpClient.DEFAULT_RETRY_DELAY_IN_MILLISECONDS;
-            },
-            shouldResetTimeout: true,
-        };
-
-        axiosRetry(this._axiosInstance, retryConfig);
-    }
-
-    private shouldRetry(config: IHttpConfig, error: AxiosError): boolean {
-        if (config.retryOnStatusCode) {
-            return !!error.response && config.retryOnStatusCode(error.response.status);
-        }
-        return axiosRetry.isNetworkOrIdempotentRequestError(error);
     }
 
     public async doRequest(requestParams: IRequestParams): Promise<IClientResponse> {
-        return await this._axiosInstance(requestParams);
+        const url = requestParams.url.startsWith('/') ? requestParams.url.slice(1) : requestParams.url;
+        const body = requestParams.data ? (typeof requestParams.data === 'string' ? requestParams.data : JSON.stringify(requestParams.data)) : undefined;
+        const options: Options = {
+            method: requestParams.method,
+            ...(body ? { body } : {}),
+            headers: requestParams.headers,
+            ...(requestParams.timeout ? { timeout: requestParams.timeout } : {}),
+            responseType: requestParams.responseType === 'json' ? 'json' : 'text',
+            followRedirect: false, // Handle manually if needed
+        };
+
+        if (requestParams.validateStatus) {
+            options.throwHttpErrors = false;
+        }
+
+        const response = await this._gotClient(url, options) as any;
+
+        if (requestParams.validateStatus && !requestParams.validateStatus(response.statusCode)) {
+            throw new Error(`Request failed with status code ${response.statusCode}`);
+        }
+
+        return {
+            data: response.body,
+            headers: response.headers,
+            status: response.statusCode
+        };
     }
 
     public async doAuthRequest(requestParams: IRequestParams): Promise<IClientResponse> {
+        const url = requestParams.url.startsWith('/') ? requestParams.url.slice(1) : requestParams.url;
+        const body = requestParams.data ? (typeof requestParams.data === 'string' ? requestParams.data : JSON.stringify(requestParams.data)) : undefined;
+        const options: Options = {
+            method: requestParams.method,
+            ...(body ? { body } : {}),
+            headers: requestParams.headers,
+            ...(requestParams.timeout ? { timeout: requestParams.timeout } : {}),
+            responseType: requestParams.responseType === 'json' ? 'json' : 'text',
+            followRedirect: false,
+        };
+
         if (this._accessToken !== '') {
-            this.addAuthHeader(requestParams);
-        } else {
-            requestParams.auth = this._basicAuth;
+            this.addAuthHeader(options);
+        } else if (requestParams.auth) {
+            options.username = requestParams.auth.username;
+            options.password = requestParams.auth.password;
         }
-        return this.doRequest(requestParams);
+
+        if (requestParams.validateStatus) {
+            options.throwHttpErrors = false;
+        }
+
+        const response = await this._gotClient(url, options) as any;
+
+        if (requestParams.validateStatus && !requestParams.validateStatus(response.statusCode)) {
+            throw new Error(`Request failed with status code ${response.statusCode}`);
+        }
+
+        return {
+            data: response.body,
+            headers: response.headers,
+            status: response.statusCode
+        };
     }
 
     /**
@@ -90,12 +151,12 @@ export class HttpClient {
         }
     }
 
-    private addAuthHeader(requestParams: IRequestParams) {
-        if (!requestParams.headers) {
-            requestParams.headers = {};
+    private addAuthHeader(options: Options) {
+        if (!options.headers) {
+            options.headers = {};
         }
-        if (!requestParams.headers[HttpClient.AUTHORIZATION_HEADER]) {
-            requestParams.headers[HttpClient.AUTHORIZATION_HEADER] = 'Bearer ' + this._accessToken;
+        if (!(options.headers as any)[HttpClient.AUTHORIZATION_HEADER]) {
+            (options.headers as any)[HttpClient.AUTHORIZATION_HEADER] = 'Bearer ' + this._accessToken;
         }
     }
 
@@ -185,35 +246,7 @@ export class HttpClient {
         return new HttpsProxyAgent(`http://${proxyConfig.host}:${proxyConfig.port}`);
     }
 
-    /**
-     * @param proxyConfig - Receives on of the three:
-     * 1. IProxyConfig to use specific proxy config.
-     * 2. 'false' to disable proxy.
-     * 3. 'undefined' to use environment variables if exist.
-     *
-     * @returns AxiosProxyConfig to use specific proxy config, false to disable proxy or undefined to use environment.
-     */
-    private getAxiosProxyConfig(proxyConfig: IProxyConfig | false | undefined): AxiosProxyConfig | false | undefined {
-        // Return false to disable proxy or undefined to use default environment variables.
-        if (!proxyConfig) {
-            return proxyConfig;
-        }
-        if (proxyConfig.protocol && !proxyConfig.protocol.includes('https')) {
-            // Disable default proxy handling
-            return false;
-        }
-        // Return undefined to use default environment variables.
-        const proxyHost: string = proxyConfig.host;
-        const proxyPort: number = proxyConfig.port;
-        if (!proxyHost && !proxyPort) {
-            return undefined;
-        }
-        return {
-            host: proxyConfig.host,
-            port: proxyConfig.port,
-            protocol: proxyConfig.protocol,
-        } as AxiosProxyConfig;
-    }
+
 }
 
 export class ServerNotActiveError extends Error {

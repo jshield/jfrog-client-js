@@ -27,8 +27,7 @@
         "dist/**/*"
     ],
     "dependencies": {
-        "axios": "~0.27.2",
-        "axios-retry": "~3.2.5",
+        "got": "^11.8.6",
         "https-proxy-agent": "^5.0.1"
     },
     "devDependencies": {
