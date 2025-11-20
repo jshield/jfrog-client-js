@@ -39,8 +39,8 @@ export class HttpClient {
             hooks: {
                 beforeRetry: [
                     (options: Options, error?: any, retryCount?: number) => {
-                        if (error && error.response && error.response.statusCode === 403) {
-                            throw new Error('Do not retry on 403'); // Prevent retry
+                        if (error && error.response && (error.response.statusCode === 403 || error.response.statusCode === 407)) {
+                            throw new Error('Do not retry on proxy/auth errors'); // Prevent retry
                         }
                         if (config.retryOnStatusCode && error && error.response) {
                             if (!config.retryOnStatusCode(error.response.statusCode)) {
